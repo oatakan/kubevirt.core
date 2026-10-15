@@ -32,6 +32,13 @@ options:
     description: Token that ensures this is a source file for the P(kubevirt.core.kubevirt#inventory) plugin.
     required: True
     choices: ["kubevirt", "kubevirt.core.kubevirt"]
+  report_source_metadata:
+    description:
+    - Publish non-sensitive metadata identifying the installed collection and this inventory plugin source.
+    type: bool
+    default: false
+    env:
+    - name: KUBEVIRT_REPORT_SOURCE_METADATA
   host_format:
     description:
     - 'Specify the format of the host in the inventory group. Available specifiers: V(name), V(namespace) and V(uid).'
@@ -169,9 +176,12 @@ EXAMPLES = """
   context: 'awx/192-168-64-4:8443/developer'
 """
 
-from dataclasses import dataclass, InitVar
+import hashlib
+import json
 import os
+from dataclasses import dataclass, InitVar
 from json import loads
+from pathlib import Path
 from re import compile as re_compile
 from typing import (
     Any,
@@ -235,12 +245,59 @@ ID_MSWINDOWS = "mswindows"
 SERVICE_TARGET_PORT_SSH = 22
 SERVICE_TARGET_PORT_WIN_MGMT_HTTP = 5985
 SERVICE_TARGET_PORT_WIN_MGMT_HTTPS = 5986
+SOURCE_METADATA_VERSION_PATTERN = re_compile(r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?\Z")
 
 
 class KubeVirtInventoryException(Exception):
     """
     This class is used for exceptions raised by this inventory.
     """
+
+
+def _load_source_metadata(plugin_file: str = __file__) -> Dict[str, str]:
+    """Return a bounded, non-sensitive identity for the installed plugin source."""
+    plugin_path = Path(plugin_file).resolve()
+    collection_root = plugin_path.parents[2]
+    manifest_path = collection_root / "MANIFEST.json"
+    try:
+        if manifest_path.stat().st_size > 65536 or plugin_path.stat().st_size > 2097152:
+            raise KubeVirtInventoryException("Installed source metadata is too large.")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            raise KubeVirtInventoryException(
+                "Installed collection metadata is invalid."
+            )
+        collection_info = manifest.get("collection_info")
+        if not isinstance(collection_info, dict):
+            raise KubeVirtInventoryException(
+                "Installed collection metadata is invalid."
+            )
+        if (
+            collection_info.get("namespace") != "kubevirt"
+            or collection_info.get("name") != "core"
+        ):
+            raise KubeVirtInventoryException(
+                "Installed collection identity is invalid."
+            )
+        version = collection_info.get("version")
+        if (
+            not isinstance(version, str)
+            or len(version) > 128
+            or not SOURCE_METADATA_VERSION_PATTERN.fullmatch(version)
+        ):
+            raise KubeVirtInventoryException("Installed collection version is invalid.")
+        digest = hashlib.sha256(plugin_path.read_bytes()).hexdigest()
+    except KubeVirtInventoryException:
+        raise
+    except (OSError, ValueError, TypeError, RecursionError) as exc:
+        raise KubeVirtInventoryException(
+            "Unable to read installed source metadata."
+        ) from exc
+    return {
+        "collection_name": "kubevirt.core",
+        "collection_version": version,
+        "plugin_sha256": digest,
+    }
 
 
 @dataclass
@@ -503,6 +560,22 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
         super().parse(inventory, loader, path)
 
         config_data = self._read_config_data(path)
+        self._source_metadata = None
+        if (
+            "report_source_metadata" in config_data
+            or os.environ.get("KUBEVIRT_REPORT_SOURCE_METADATA") is not None
+        ):
+            try:
+                report_source_metadata = boolean(
+                    self.get_option("report_source_metadata")
+                )
+            except (TypeError, ValueError) as exc:
+                raise KubeVirtInventoryException(
+                    "report_source_metadata must be a boolean."
+                ) from exc
+            if report_source_metadata:
+                self._source_metadata = _load_source_metadata()
+
         cache_key = self.get_cache_key(path)
         user_cache_setting = self.get_option("cache")
         attempt_to_read_cache = user_cache_setting and cache
@@ -975,6 +1048,14 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             # Create label groups and add vm to it if enabled
             if opts.create_groups:
                 self._set_groups_from_labels(hostname, labels)
+
+        source_metadata = getattr(self, "_source_metadata", None)
+        if source_metadata is not None:
+            self.inventory.set_variable(
+                hostname,
+                "kubevirt_inventory_source_metadata",
+                source_metadata.copy(),
+            )
         if resource_version := obj["metadata"].get("resourceVersion"):
             self.inventory.set_variable(
                 hostname, f"{prefix}_resource_version", resource_version
